@@ -1,56 +1,104 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# 호환성을 위해 현재 셸이 bash가 아닐 경우 bash로 재실행
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
+
+# 파이프라인 에러 방지 (Robust Bash Strict Mode)
+# -e: 파이프라인 내 명령어 실패 시 즉시 종료
+# -u: 정의되지 않은 변수 사용 시 에러 발생
+# -o pipefail: 파이프라인 중간에서 발생한 에러를 무시하지 않고 반환
+set -euo pipefail
 
 # ==============================================================================
-# 8 GPUs 분산 학습 실행 스크립트 (PyTorch DDP)
-# 실행 방법: 터미널에서 `bash train_run.sh` 또는 `./train_run.sh` 입력
+# light_drive Ablation Study 매트릭스 구성
+# 목적: ViT/DeiT 백본 차이 및 Multi-Camera 퓨전을 위한 2가지 조건화 기법의 영향도 평가
+# 총 실험 횟수: 2 (Backbones) x 2 (Cam Emb) x 2 (Geom) = 8회 순차 실행
 # ==============================================================================
 
-# 1. 로그(Log) 파일 저장을 위한 폴더 및 파일명 설정
 LOG_DIR=./logs
-mkdir -p "$LOG_DIR" # logs 폴더가 없으면 생성합니다. (-p 옵션: 에러 무시 및 상위 폴더 자동 생성)
+mkdir -p "$LOG_DIR" # 실험 기록용 로그 디렉토리 보장
 
-# 현재 날짜와 시간(년월일_시분초)을 활용하여 덮어씌워지지 않는 고유한 로그 파일명을 생성합니다.
-# (예: ./logs/train_20260601_155000.log)
-LOGFILE="$LOG_DIR/train_$(date +%Y%m%d_%H%M%S).log"
+# 실험 하이퍼파라미터 검색 공간 정의
+BACKBONES=("deit_small_patch16_224" "vit_base_patch16_224")
+CAM_EMB=("true" "false")
+GEOM=("true" "false")
 
-echo "🚀 학습을 시작합니다..."
-echo "Logging to $LOGFILE"
+for backbone in "${BACKBONES[@]}"; do
+  for cam_emb in "${CAM_EMB[@]}"; do
+    for geom in "${GEOM[@]}"; do
+      
+      # 1. 동적 실험 식별자(Experiment Name) 생성
+      # 체크포인트 저장 폴더명 및 로그 파일명으로 사용되어 실험 결과 추적을 용이하게 함
+      exp_name="light_drive_${backbone}"
+      
+      if [[ "$cam_emb" == "true" ]]; then
+        exp_name+="_cam_on"
+      else
+        exp_name+="_cam_off"
+      fi
+      
+      if [[ "$geom" == "true" ]]; then
+        exp_name+="_geom_on"
+      else
+        exp_name+="_geom_off"
+      fi
 
-# ---------------------------------------------------------
-# [옵션 A] 포그라운드(Foreground) 실행 모드 (현재 활성화됨)
-# 터미널 화면에 학습 진행 상황을 실시간으로 출력하면서, 동시에 로그 파일에도 저장합니다.
-# ---------------------------------------------------------
-# python3 -m torch.distributed.run 은 torchrun 명령어와 완전히 동일한 역할을 합니다.
-python3 -m torch.distributed.run --nproc_per_node=8 train_new.py \
-    --distributed \
-    --nusc-root ./ \
-    --label-path hybrid_teacher_labels_final.json \
-    --batch-size 2 \
-    --val-split 0.05 \
-    --val-batch-size 2 \
-    --epochs 30 \
-    --output-dir ./checkpoints/light_drive 2>&1 | tee "$LOGFILE"
-    # [설명] 2>&1 : 프로그램의 에러 메시지(표준 에러)를 일반 메시지(표준 출력)와 하나로 합칩니다.
-    # [설명] | tee "$LOGFILE" : 합쳐진 메시지를 터미널 화면에 보여주는 동시에(T자 형태 분기), 파일로도 저장합니다.
+      OUT_DIR="./checkpoints/${exp_name}"
+      # 타임스탬프를 부여하여 이전 실험 로그 덮어쓰기 방지
+      LOGFILE="$LOG_DIR/${exp_name}_$(date +%Y%m%d_%H%M%S).log"
 
+      echo "============================================================="
+      echo "Running experiment: $exp_name"
+      echo "Backbone: $backbone"
+      echo "Camera Embedding: $cam_emb"
+      echo "Geometry Conditioning: $geom"
+      echo "Output dir: $OUT_DIR"
+      echo "Log file: $LOGFILE"
+      echo "============================================================="
 
-# ---------------------------------------------------------
-# [옵션 B] 백그라운드(Background) 실행 모드 
-# 터미널 창을 끄거나 SSH 접속이 끊겨도 학습이 계속 돌아가게 하려면 
-# 위의 [옵션 A] 코드를 주석 처리(#)하고, 아래 코드들의 주석을 해제하세요.
-# ---------------------------------------------------------
-# nohup torchrun --nproc_per_node=8 train_new.py \
-#   --distributed \
-#   --nusc-root ./ \
-#   --label-path hybrid_teacher_labels_final.json \
-#   --batch-size 2 \
-#   --epochs 30 \
-#   --output-dir ./checkpoints/light_drive > "$LOGFILE" 2>&1 &
-    # [설명] nohup : 터미널이 끊겨도 프로세스를 종료하지 말라는 명령어입니다.
-    # [설명] > "$LOGFILE" 2>&1 : 화면에 출력하지 말고 모든 메시지와 에러를 로그 파일로 바로 보냅니다.
-    # [설명] & : 명령어를 백그라운드에서 실행하라는 뜻입니다.
+      # 2. Base Command 구성 (DDP 런처 적용)
+      # 단일 노드 내 8개의 GPU를 사용하는 분산 학습 명령
+      # 배열(cmd)을 사용하여 파라미터를 관리하면 공백이나 특수문자 처리가 안전함
+      cmd=(python3 -m torch.distributed.run --nproc_per_node=8 train_new.py
+        --distributed
+        --nusc-root ./
+        --label-path hybrid_teacher_labels_final.json
+        --batch-size 2             # GPU당 배치 사이즈 (Global Batch Size = 2 * 8 = 16)
+        --val-split 0.05
+        --val-batch-size 2
+        --epochs 30
+        --vision-backbone "$backbone"
+      )
 
-# echo $! > "$LOG_DIR/train.pid"
-    # [설명] $! : 방금 백그라운드(&)로 실행시킨 프로세스의 고유 ID(PID)를 의미합니다.
-    # 이를 train.pid 파일에 저장해두면, 나중에 학습을 강제로 중단하고 싶을 때 
-    # 터미널에서 `kill $(cat ./logs/train.pid)` 명령어를 입력하여 쉽게 종료할 수 있습니다.
+      # 3. Ablation 조건에 따른 동적 Flag 주입 (argparse action="store_true/false" 대응)
+      if [[ "$cam_emb" == "true" ]]; then
+        cmd+=(--use-camera-embedding)
+      else
+        cmd+=(--no-camera-embedding)
+      fi
+
+      if [[ "$geom" == "true" ]]; then
+        cmd+=(--use-geometry-conditioning)
+      else
+        cmd+=(--no-geometry-conditioning)
+      fi
+
+      cmd+=(--output-dir "$OUT_DIR")
+
+      # 4. 명령어 실행 및 로깅
+      # 나중에 디버깅이나 재현을 위해 실제 실행되는 전체 명령어를 로그 최상단에 기록
+      echo "${cmd[*]}" | tee "$LOGFILE"
+      
+      # 표준 출력(stdout)과 표준 에러(stderr)를 모두 로그 파일에 누적 기록(-a)하면서 콘솔에도 출력
+      "${cmd[@]}" 2>&1 | tee -a "$LOGFILE"
+
+      echo ""
+      echo "Finished experiment: $exp_name"
+      echo "-------------------------------------------------------------"
+      
+      # (Optional) 실험 간 GPU 메모리 릴리즈를 확실히 하기 위해 짧은 sleep을 줄 수도 있습니다.
+      # sleep 5 
+    done
+  done
+ done
